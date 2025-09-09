@@ -1,5 +1,6 @@
 import math
 import copy
+import os
 from pathlib import Path
 from random import random
 from functools import partial
@@ -244,6 +245,35 @@ class Attention(nn.Module):
         out = rearrange(out, 'b h (x y) d -> b (h d) x y', x = h, y = w)
         return self.to_out(out)
 
+class CrossAttention(nn.Module):
+    def __init__(self, dim, context_dim, heads = 4, dim_head = 32):
+        super().__init__()
+        self.scale = dim_head ** -0.5
+        self.heads = heads
+        hidden_dim = dim_head * heads
+        self.to_q = nn.Conv2d(dim, hidden_dim, 1, bias = False)
+        self.to_kv = nn.Linear(context_dim, hidden_dim * 2, bias = False)
+        self.to_out = nn.Conv2d(hidden_dim, dim, 1)
+
+    def forward(self, x, context):
+        b, c, h, w = x.shape
+        q = self.to_q(x)
+        q = rearrange(q, 'b (h d) x y -> b h (x y) d', h = self.heads)
+
+        if context.ndim == 2:
+            context = rearrange(context, 'b d -> b 1 d')
+
+        k, v = self.to_kv(context).chunk(2, dim = -1)
+        k = rearrange(k, 'b n (h d) -> b h n d', h = self.heads)
+        v = rearrange(v, 'b n (h d) -> b h n d', h = self.heads)
+
+        q = q * self.scale
+        sim = einsum('b h i d, b h j d -> b h i j', q, k)
+        attn = sim.softmax(dim = -1)
+        out = einsum('b h i j, b h j d -> b h i d', attn, v)
+        out = rearrange(out, 'b h (x y) d -> b (h d) x y', h = self.heads, x = h, y = w)
+        return self.to_out(out)
+
 # model
 
 class Unet(nn.Module):
@@ -258,7 +288,8 @@ class Unet(nn.Module):
         learned_variance = False,
         learned_sinusoidal_cond = False,
         random_fourier_features = False,
-        learned_sinusoidal_dim = 16
+        learned_sinusoidal_dim = 16,
+        cond_dim = None
     ):
         super().__init__()
 
@@ -266,6 +297,7 @@ class Unet(nn.Module):
 
         self.channels = channels
         self.self_condition = self_condition
+        self.cond_dim = cond_dim
         input_channels = channels * (2 if self_condition else 1)
 
         init_dim = default(init_dim, dim)
@@ -302,26 +334,31 @@ class Unet(nn.Module):
 
         for ind, (dim_in, dim_out) in enumerate(in_out):
             is_last = ind >= (num_resolutions - 1)
+            cross_attn = Residual(PreNorm(dim_in, CrossAttention(dim_in, cond_dim))) if exists(cond_dim) else nn.Identity()
 
             self.downs.append(nn.ModuleList([
                 ResnetBlock(dim_in, dim_in, time_emb_dim = time_dim),
                 ResnetBlock(dim_in, dim_in, time_emb_dim = time_dim),
                 Residual(PreNorm(dim_in, LinearAttention(dim_in))),
+                cross_attn,
                 Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(dim_in, dim_out, 3, padding = 1)
             ]))
 
         mid_dim = dims[-1]
         self.mid_block1 = ResnetBlock(mid_dim, mid_dim, time_emb_dim = time_dim)
         self.mid_attn = Residual(PreNorm(mid_dim, Attention(mid_dim)))
+        self.mid_cross_attn = Residual(PreNorm(mid_dim, CrossAttention(mid_dim, cond_dim))) if exists(cond_dim) else nn.Identity()
         self.mid_block2 = ResnetBlock(mid_dim, mid_dim, time_emb_dim = time_dim)
 
         for ind, (dim_in, dim_out) in enumerate(reversed(in_out)):
             is_last = ind == (len(in_out) - 1)
+            cross_attn = Residual(PreNorm(dim_out, CrossAttention(dim_out, cond_dim))) if exists(cond_dim) else nn.Identity()
 
             self.ups.append(nn.ModuleList([
                 ResnetBlock(dim_out + dim_in, dim_out, time_emb_dim = time_dim),
                 ResnetBlock(dim_out + dim_in, dim_out, time_emb_dim = time_dim),
                 Residual(PreNorm(dim_out, LinearAttention(dim_out))),
+                cross_attn,
                 Upsample(dim_out, dim_in) if not is_last else  nn.Conv2d(dim_out, dim_in, 3, padding = 1)
             ]))
 
@@ -331,7 +368,7 @@ class Unet(nn.Module):
         self.final_res_block = ResnetBlock(dim * 2, dim, time_emb_dim = time_dim)
         self.final_conv = nn.Conv2d(dim, self.out_dim, 1)
 
-    def forward(self, x, time, x_self_cond = None):
+    def forward(self, x, time, x_self_cond = None, context = None):
         if self.self_condition:
             x_self_cond = default(x_self_cond, lambda: torch.zeros_like(x))
             x = torch.cat((x_self_cond, x), dim = 1)
@@ -343,27 +380,33 @@ class Unet(nn.Module):
 
         h = []
 
-        for block1, block2, attn, downsample in self.downs:
+        for block1, block2, attn, cross_attn, downsample in self.downs:
             x = block1(x, t)
             h.append(x)
 
             x = block2(x, t)
             x = attn(x)
+            if exists(self.cond_dim) and exists(context):
+                x = cross_attn(x, context = context)
             h.append(x)
 
             x = downsample(x)
 
         x = self.mid_block1(x, t)
         x = self.mid_attn(x)
+        if exists(self.cond_dim) and exists(context):
+            x = self.mid_cross_attn(x, context = context)
         x = self.mid_block2(x, t)
 
-        for block1, block2, attn, upsample in self.ups:
+        for block1, block2, attn, cross_attn, upsample in self.ups:
             x = torch.cat((x, h.pop()), dim = 1)
             x = block1(x, t)
 
             x = torch.cat((x, h.pop()), dim = 1)
             x = block2(x, t)
             x = attn(x)
+            if exists(self.cond_dim) and exists(context):
+                x = cross_attn(x, context = context)
 
             x = upsample(x)
 
@@ -558,8 +601,8 @@ class GaussianDiffusion(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False):
-        model_output = self.model(x, t, x_self_cond)
+    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, context = None):
+        model_output = self.model(x, t, x_self_cond, context = context)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
@@ -580,8 +623,8 @@ class GaussianDiffusion(nn.Module):
 
         return ModelPrediction(pred_noise, x_start)
 
-    def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True):
-        preds = self.model_predictions(x, t, x_self_cond)
+    def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True, context = None):
+        preds = self.model_predictions(x, t, x_self_cond, context = context)
         x_start = preds.pred_x_start
 
         if clip_denoised:
@@ -610,11 +653,11 @@ class GaussianDiffusion(nn.Module):
 
         
     @torch.no_grad()
-    def p_sample(self, x, t: int, x_self_cond = None, cond_fn=None, guidance_kwargs=None):
+    def p_sample(self, x, t: int, x_self_cond = None, cond_fn=None, guidance_kwargs=None, context = None):
         b, *_, device = *x.shape, x.device
         batched_times = torch.full((b,), t, device = x.device, dtype = torch.long)
         model_mean, variance, model_log_variance, x_start = self.p_mean_variance(
-            x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True
+            x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True, context = context
         )
         if exists(cond_fn) and exists(guidance_kwargs):
             model_mean = self.condition_mean(cond_fn, model_mean, variance, x, batched_times, guidance_kwargs)
@@ -624,7 +667,7 @@ class GaussianDiffusion(nn.Module):
         return pred_img, x_start
 
     @torch.no_grad()
-    def p_sample_loop(self, shape, return_all_timesteps = False, cond_fn=None, guidance_kwargs=None):
+    def p_sample_loop(self, shape, return_all_timesteps = False, cond_fn=None, guidance_kwargs=None, context = None):
         batch, device = shape[0], self.betas.device
 
         img = torch.randn(shape, device = device)
@@ -634,7 +677,7 @@ class GaussianDiffusion(nn.Module):
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, self_cond, cond_fn, guidance_kwargs)
+            img, x_start = self.p_sample(img, t, self_cond, cond_fn, guidance_kwargs, context = context)
             imgs.append(img)
 
         ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
@@ -643,7 +686,7 @@ class GaussianDiffusion(nn.Module):
         return ret
 
     @torch.no_grad()
-    def ddim_sample(self, shape, return_all_timesteps = False, cond_fn=None, guidance_kwargs=None):
+    def ddim_sample(self, shape, return_all_timesteps = False, cond_fn=None, guidance_kwargs=None, context = None):
         batch, device, total_timesteps, sampling_timesteps, eta, objective = shape[0], self.betas.device, self.num_timesteps, self.sampling_timesteps, self.ddim_sampling_eta, self.objective
 
         times = torch.linspace(-1, total_timesteps - 1, steps = sampling_timesteps + 1)   # [-1, 0, 1, 2, ..., T-1] when sampling_timesteps == total_timesteps
@@ -658,7 +701,7 @@ class GaussianDiffusion(nn.Module):
         for time, time_next in tqdm(time_pairs, desc = 'sampling loop time step'):
             time_cond = torch.full((batch,), time, device = device, dtype = torch.long)
             self_cond = x_start if self.self_condition else None
-            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = True)
+            pred_noise, x_start, *_ = self.model_predictions(img, time_cond, self_cond, clip_x_start = True, context = context)
 
             imgs.append(img)
 
@@ -684,10 +727,10 @@ class GaussianDiffusion(nn.Module):
         return ret
 
     @torch.no_grad()
-    def sample(self, batch_size = 16, return_all_timesteps = False, cond_fn=None, guidance_kwargs=None):
+    def sample(self, batch_size = 16, return_all_timesteps = False, cond_fn=None, guidance_kwargs=None, context = None):
         image_size, channels = self.image_size, self.channels
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
-        return sample_fn((batch_size, channels, image_size, image_size), return_all_timesteps = return_all_timesteps, cond_fn=cond_fn, guidance_kwargs=guidance_kwargs)
+        return sample_fn((batch_size, channels, image_size, image_size), return_all_timesteps = return_all_timesteps, cond_fn=cond_fn, guidance_kwargs=guidance_kwargs, context = context)
 
     @torch.no_grad()
     def interpolate(self, x1, x2, t = None, lam = 0.5):
@@ -718,27 +761,19 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
-    def p_losses(self, x_start, t, noise = None):
+    def p_losses(self, x_start, t, noise = None, context = None):
         b, c, h, w = x_start.shape
         noise = default(noise, lambda: torch.randn_like(x_start))
 
-        # noise sample
-
         x = self.q_sample(x_start = x_start, t = t, noise = noise)
-
-        # if doing self-conditioning, 50% of the time, predict x_start from current set of times
-        # and condition with unet with that
-        # this technique will slow down training by 25%, but seems to lower FID significantly
 
         x_self_cond = None
         if self.self_condition and random() < 0.5:
             with torch.no_grad():
-                x_self_cond = self.model_predictions(x, t).pred_x_start
+                x_self_cond = self.model_predictions(x, t, context = context).pred_x_start
                 x_self_cond.detach_()
 
-        # predict and take gradient step
-
-        model_out = self.model(x, t, x_self_cond)
+        model_out = self.model(x, t, x_self_cond, context = context)
 
         if self.objective == 'pred_noise':
             target = noise
@@ -756,13 +791,13 @@ class GaussianDiffusion(nn.Module):
         loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
 
-    def forward(self, img, *args, **kwargs):
+    def forward(self, img, *args, context = None, **kwargs):
         b, c, h, w, device, img_size, = *img.shape, img.device, self.image_size
         assert h == img_size and w == img_size, f'height and width of image must be {img_size}'
         t = torch.randint(0, self.num_timesteps, (b,), device=device).long()
 
         img = self.normalize(img)
-        return self.p_losses(img, t, *args, **kwargs)
+        return self.p_losses(img, t, *args, context = context, **kwargs)
 
 # dataset classes
 
@@ -798,6 +833,45 @@ class Dataset(Dataset):
         img = Image.open(path)
         return self.transform(img)
 
+class ImageEmbeddingDataset(Dataset):
+    def __init__(
+        self,
+        folder,
+        embedding_file,
+        image_size,
+        exts = ['jpg', 'jpeg', 'png', 'tiff'],
+        augment_horizontal_flip = False,
+        convert_image_to = None
+    ):
+        super().__init__()
+        self.folder = folder
+        self.image_size = image_size
+        self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
+
+        data = torch.load(embedding_file)
+        self.embedding_map = {name: emb for name, emb in zip(data['filenames'], data['embeddings'])}
+
+        maybe_convert_fn = partial(convert_image_to_fn, convert_image_to) if exists(convert_image_to) else nn.Identity()
+
+        self.transform = T.Compose([
+            T.Lambda(maybe_convert_fn),
+            T.Resize(image_size),
+            T.RandomHorizontalFlip() if augment_horizontal_flip else nn.Identity(),
+            T.CenterCrop(image_size),
+            T.ToTensor()
+        ])
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, index):
+        path = self.paths[index]
+        img = Image.open(path)
+        img = self.transform(img)
+        key = os.path.basename(path)
+        emb = self.embedding_map[key]
+        return img, emb
+
 # trainer class
 
 class Trainer(object):
@@ -806,6 +880,7 @@ class Trainer(object):
         diffusion_model,
         folder,
         *,
+        embedding_file = None,
         train_batch_size = 16,
         gradient_accumulate_every = 1,
         augment_horizontal_flip = True,
@@ -845,7 +920,11 @@ class Trainer(object):
 
         # dataset and dataloader
 
-        self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        if exists(embedding_file):
+            self.ds = ImageEmbeddingDataset(folder, embedding_file, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+        else:
+            self.ds = Dataset(folder, self.image_size, augment_horizontal_flip = augment_horizontal_flip, convert_image_to = convert_image_to)
+
         dl = DataLoader(self.ds, batch_size = train_batch_size, shuffle = True, pin_memory = True, num_workers = cpu_count())
 
         dl = self.accelerator.prepare(dl)
@@ -916,10 +995,15 @@ class Trainer(object):
                 total_loss = 0.
 
                 for _ in range(self.gradient_accumulate_every):
-                    data = next(self.dl).to(device)
+                    batch = next(self.dl)
+                    if isinstance(batch, (list, tuple)):
+                        data, context = batch
+                        data, context = data.to(device), context.to(device)
+                    else:
+                        data, context = batch.to(device), None
 
                     with self.accelerator.autocast():
-                        loss = self.model(data)
+                        loss = self.model(data, context = context)
                         loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
 
@@ -946,7 +1030,16 @@ class Trainer(object):
                         with torch.no_grad():
                             milestone = self.step // self.save_and_sample_every
                             batches = num_to_groups(self.num_samples, self.batch_size)
-                            all_images_list = list(map(lambda n: self.ema.ema_model.sample(batch_size=n), batches))
+                            all_images_list = []
+                            for n in batches:
+                                if exists(context):
+                                    sample_context = context[:n]
+                                    if sample_context.shape[0] < n:
+                                        sample_context = sample_context.repeat((n // sample_context.shape[0] + 1, 1))[:n]
+                                    imgs = self.ema.ema_model.sample(batch_size=n, context=sample_context)
+                                else:
+                                    imgs = self.ema.ema_model.sample(batch_size=n)
+                                all_images_list.append(imgs)
 
                         all_images = torch.cat(all_images_list, dim = 0)
                         utils.save_image(all_images, str(self.results_folder / f'sample-{milestone}.png'), nrow = int(math.sqrt(self.num_samples)))
